@@ -3,26 +3,97 @@
  import (
          "fmt"
          "log"
-         "io/ioutil"
          "math"
          "os"
          "strconv"
          "bufio"
          "context"
+         "time"
+         "math/rand"
+         "strings"
+         "io/ioutil"
          
          "github.com/nchcl/sd/chat"
          "google.golang.org/grpc"
  )
 
-func send_chunk() {
-    var conn *grpc.ClientConn
-	conn, err := grpc.Dial(":9001", grpc.WithInsecure())
+
+//Funcion para ejecutar el downloader, pide las direcciones al nameNode y luego los chunks a los dataNodes
+func downloader() {
+    var name string
+    fmt.Println("¿Que libro desea descargar?")
+    fmt.Scan(&name)
+    
+    conn, err := grpc.Dial(addresses[0], grpc.WithInsecure())
 	if err != nil {
 		log.Fatalf("did not connect: %s", err)
 	}
 	defer conn.Close()
+    
+    c := chat.NewChatServiceClient(conn)
+    response, err := c.ConsultarUbicacion(context.Background(), &chat.Signal{Nombre: name})
+    if err != nil {
+        log.Fatalf("Error: %s", err)
+    }
+    
+    log.Printf("%s", response.Nombre)
+    
+    direcciones := strings.Split(response.Body, ",")
+    partes := len(direcciones)
+    
+    for i:=0; i < partes; i++ {
+        archivo := name+" Parte_"+strconv.Itoa(i+1)
+        
+        connchunk, err := grpc.Dial(direcciones[i], grpc.WithInsecure())
+        if err != nil {
+            log.Fatalf("did not connect: %s", err)
+        }
+        defer connchunk.Close()
+    
+        c := chat.NewChatServiceClient(connchunk)
+        respuesta, err := c.PedirChunk(context.Background(), &chat.Signal{Nombre: archivo})
+        if err != nil {
+            log.Fatalf("Error: %s", err)
+        }
+        log.Printf("%s", respuesta.Name)
+        ioutil.WriteFile(archivo, respuesta.Data, 0777)
+    }
+    
+    combinar(name, uint64(partes))
+}
 
-    fileToBeChunked := "Frankenstein-Mary_Shelley.pdf"
+//Funcion para subir un libro, primero checkea si los nodos estan vivos o no
+//Se elige un dataNode aleatorio
+func uploader(nombre_libro string) {
+    var nodos_vivos [4]int = [4]int{1,1,1,1}
+    var nodo_a_enviar int = azar()
+    var errconn error
+    
+    for j := 1; j < 4; j++ {
+        _, errconn = grpc.Dial(addresses[j], grpc.WithInsecure(), grpc.WithBlock(), grpc.FailOnNonTempDialError(true))
+        if errconn != nil {
+            fmt.Printf("Nodo %d muerto\n", j)
+            nodos_vivos[j] = 0
+        }
+    }
+    
+    for nodos_vivos[nodo_a_enviar] == 0 {
+        fmt.Printf("Nodo %d caido, reintentando con otro nodo...\n", nodo_a_enviar)
+        if nodo_a_enviar == 3 {
+            nodo_a_enviar = 1
+        } else {
+            nodo_a_enviar++
+        }
+    }
+    
+    var conn *grpc.ClientConn
+    conn, err := grpc.Dial(addresses[nodo_a_enviar], grpc.WithInsecure())
+    if err != nil {
+        log.Fatalf("did not connect: %s", err)
+    }
+    defer conn.Close()
+
+    fileToBeChunked := nombre_libro
     file, err := os.Open(fileToBeChunked)
     if err != nil {
             fmt.Println(err)
@@ -40,330 +111,151 @@ func send_chunk() {
         partBuffer := make([]byte, partSize)
         file.Read(partBuffer)
         
-        fileName := "Frankenstein-Mary_Shelley Parte_" + strconv.FormatUint(i+1, 10)
+        fileName := nombre_libro+" Parte_"+strconv.FormatUint(i+1, 10)
         
         c := chat.NewChatServiceClient(conn)
         response, err := c.SendChunks(context.Background(), &chat.Chunk{Name: fileName,Parts: int32(totalPartsNum),Data: partBuffer})
         if err != nil {
-		log.Fatalf("Error: %s", err)
+            log.Fatalf("Error: %s", err)
         }
         log.Printf("%s", response.Body)
     }
     
     c := chat.NewChatServiceClient(conn)
-    response, err := c.TransferenciaLista(context.Background(), &chat.Signal{Id: int32(totalPartsNum)})
-    if err != nil {
-    log.Fatalf("Error: %s", err)
-    }
-    log.Printf("%s", response.Body)
     
-	
-}
- 
-func uploader(nombre_libro string){
-        fileToBeChunked := nombre_libro
-
-        file, err := os.Open(fileToBeChunked)
-
+    if tipo_algoritmo == 1 {
+        response, err := c.TransferenciaLista(context.Background(), &chat.Signal{Id: int32(totalPartsNum)+20, Nombre: nombre_libro, Iden: int32(nodo_a_enviar)}) // aqui debo mandar el nombre del archivo...
         if err != nil {
-                fmt.Println(err)
-                os.Exit(1)
+            log.Fatalf("Error: %s", err)
         }
-
-        defer file.Close()
-
-        fileInfo, _ := file.Stat()
-
-        var fileSize int64 = fileInfo.Size()
-        var ip string
-        const fileChunk = 256000 // 1 MB, change this to your requirement
-
-        // calculate total number of parts the file will be chunked into
-
-        totalPartsNum := uint64(math.Ceil(float64(fileSize) / float64(fileChunk)))
-
-        fmt.Printf("%s | %d \n", fileToBeChunked, totalPartsNum)
-
-        for i := uint64(0); i < totalPartsNum; i++ {
-                ip=strconv.FormatUint(i+1, 10) //AQUI DEBE IR LA IP DONDE SE GUARDARA EL CHUNK
-
-                partSize := int(math.Min(fileChunk, float64(fileSize-int64(i*fileChunk))))
-                partBuffer := make([]byte, partSize)
-
-                file.Read(partBuffer)
-
-                // write to disk
-                fileName := "Parte_" + strconv.FormatUint(i+1, 10)
-                _, err := os.Create(fileName)
-
-                if err != nil {
-                        fmt.Println(err)
-                        os.Exit(1)
-                }
-
-                // write/save buffer to disk
-                ioutil.WriteFile(fileName, partBuffer, os.ModeAppend)
-
-                fmt.Println(fileName, " | ", ip)
+        log.Printf("%s", response.Body)
+    } else {
+        response, err := c.TransferenciaLista(context.Background(), &chat.Signal{Id: int32(totalPartsNum), Nombre: nombre_libro, Iden: int32(nodo_a_enviar)})
+        if err != nil {
+            log.Fatalf("Error: %s", err)
         }
+        log.Printf("%s", response.Body)
+    }
+
 }
 
 
-func downloader(nombre_libro string){
+//Funcion para combinar las partes luego de descargarlas con el downloader
+func combinar(nombre_libro string , cantidad_partes uint64){
+        var file *os.File
+        var err error
+        var totalPartsNum uint64
+        totalPartsNum=cantidad_partes
 
-        fileToBeChunked := nombre_libro // change here!
-
-         file, err := os.Open(fileToBeChunked)
-
-         if err != nil {
-                 fmt.Println(err)
-                 os.Exit(1)
-         }
-
-         defer file.Close()
-
-         fileInfo, _ := file.Stat()
-
-         var fileSize int64 = fileInfo.Size()
-
-         const fileChunk = 1 * (1 << 20) // 1 MB, change this to your requirement
-
-         // calculate total number of parts the file will be chunked into
-
-         totalPartsNum := uint64(math.Ceil(float64(fileSize) / float64(fileChunk)))
-
-         fmt.Printf("Splitting to %d pieces.\n", totalPartsNum)
-
-         for i := uint64(0); i < totalPartsNum; i++ {
-
-                 partSize := int(math.Min(fileChunk, float64(fileSize-int64(i*fileChunk))))
-                 partBuffer := make([]byte, partSize)
-
-                 file.Read(partBuffer)
-
-                 // write to disk
-                 fileName := "bigfile_" + strconv.FormatUint(i, 10)
-                 _, err := os.Create(fileName)
-
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
-
-                 // write/save buffer to disk
-                 ioutil.WriteFile(fileName, partBuffer, os.ModeAppend)
-
-                 fmt.Println("Split to : ", fileName)
-         }
-
-         // just for fun, let's recombine back the chunked files in a new file
-
-         newFileName := nombre_libro
-         _, err = os.Create(newFileName)
-
-         if err != nil {
-                 fmt.Println(err)
-                 os.Exit(1)
-         }
-
-         //set the newFileName file to APPEND MODE!!
-         // open files r and w
-
-         file, err = os.OpenFile(newFileName, os.O_APPEND|os.O_WRONLY, os.ModeAppend)
-
-         if err != nil {
-                 fmt.Println(err)
-                 os.Exit(1)
-         }
-
-         // IMPORTANT! do not defer a file.Close when opening a file for APPEND mode!
-         // defer file.Close()
-
-         // just information on which part of the new file we are appending
-         var writePosition int64 = 0
-
-         for j := uint64(0); j < totalPartsNum; j++ {
-
-                 //read a chunk
-                 currentChunkFileName := "bigfile_" + strconv.FormatUint(j, 10)
-
-                 newFileChunk, err := os.Open(currentChunkFileName)
-
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
-
-                 defer newFileChunk.Close()
-
-                 chunkInfo, err := newFileChunk.Stat()
-
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
-
-                 // calculate the bytes size of each chunk
-                 // we are not going to rely on previous data and constant
-
-                 var chunkSize int64 = chunkInfo.Size()
-                 chunkBufferBytes := make([]byte, chunkSize)
-
-                 fmt.Println("Appending at position : [", writePosition, "] bytes")
-                 writePosition = writePosition + chunkSize
-
-                 // read into chunkBufferBytes
-                 reader := bufio.NewReader(newFileChunk)
-                 _, err = reader.Read(chunkBufferBytes)
-
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
-
-                 // DON't USE ioutil.WriteFile -- it will overwrite the previous bytes!
-                 // write/save buffer to disk
-                 //ioutil.WriteFile(newFileName, chunkBufferBytes, os.ModeAppend)
-
-                 n, err := file.Write(chunkBufferBytes)
-
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
-
-                 file.Sync() //flush to disk
-
-                 // free up the buffer for next cycle
-                 // should not be a problem if the chunk size is small, but
-                 // can be resource hogging if the chunk size is huge.
-                 // also a good practice to clean up your own plate after eating
-
-                 chunkBufferBytes = nil // reset or empty our buffer
-
-                 fmt.Println("Written ", n, " bytes")
-
-                 fmt.Println("Recombining part [", j, "] into : ", newFileName)
-         }
-
-         // now, we close the newFileName
-         file.Close()
-        /*fmt.Println(nombre_libro) 
-        newFileName := nombre_libro+".zip"
+        newFileName := nombre_libro
         _, err = os.Create(newFileName)
 
-         if err != nil {
+        if err != nil {
+            fmt.Println(err)
+            os.Exit(1)
+        }
+
+        file, err = os.OpenFile(newFileName, os.O_APPEND|os.O_WRONLY, os.ModeAppend)
+
+        if err != nil {
+            fmt.Println(err)
+            os.Exit(1)
+        }
+
+        var writePosition int64 = 0
+
+        for j := uint64(0); j < totalPartsNum; j++ {
+
+        //read a chunk
+            currentChunkFileName := nombre_libro+" Parte_"+strconv.FormatUint(j+1, 10)
+
+            newFileChunk, err := os.Open(currentChunkFileName)
+
+            if err != nil {
                  fmt.Println(err)
                  os.Exit(1)
-         }
+            }
 
-         //set the newFileName file to APPEND MODE!!
-         // open files r and w
+            defer newFileChunk.Close()
 
-         file, err = os.OpenFile(newFileName, os.O_APPEND|os.O_WRONLY, os.ModeAppend)
+            chunkInfo, err := newFileChunk.Stat()
 
-         if err != nil {
+            if err != nil {
                  fmt.Println(err)
                  os.Exit(1)
-         }
+            }
 
-         // IMPORTANT! do not defer a file.Close when opening a file for APPEND mode!
-         // defer file.Close()
+            // calculate the bytes size of each chunk
+            // we are not going to rely on previous data and constant
 
-         // just information on which part of the new file we are appending
-         var writePosition int64 = 0
-         var totalPartsNum=5 //Aqui deberia indicarse la cantidad de partes que se dividio el archivo
+            var chunkSize int64 = chunkInfo.Size()
+            chunkBufferBytes := make([]byte, chunkSize)
 
-         for j := 0; j < totalPartsNum; j++ {
+            fmt.Println("Appending at position : [", writePosition, "] bytes")
+            writePosition = writePosition + chunkSize
 
-                 //read a chunk
-                 currentChunkFileName := "Parte_" + strconv.Itoa(j)
+            // read into chunkBufferBytes
+            reader := bufio.NewReader(newFileChunk)
+            _, err = reader.Read(chunkBufferBytes)
 
-                 newFileChunk, err := os.Open(currentChunkFileName)
+            if err != nil {
+                 fmt.Println(err)
+                 os.Exit(1)
+            }
 
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
+            n, err := file.Write(chunkBufferBytes)
 
-                 defer newFileChunk.Close()
+            if err != nil {
+                 fmt.Println(err)
+                 os.Exit(1)
+            }
 
-                 chunkInfo, err := newFileChunk.Stat()
+            file.Sync() //flush to disk
 
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
+            chunkBufferBytes = nil // reset or empty our buffer
 
-                 // calculate the bytes size of each chunk
-                 // we are not going to rely on previous data and constant
+            fmt.Println("Written ", n, " bytes")
 
-                 var chunkSize int64 = chunkInfo.Size()
-                 chunkBufferBytes := make([]byte, chunkSize)
+            fmt.Println("Recombining part [", j, "] into : ", newFileName)
+        }
 
-                 fmt.Println("Appending at position : [", writePosition, "] bytes")
-                 writePosition = writePosition + chunkSize
-
-                 // read into chunkBufferBytes
-                 reader := bufio.NewReader(newFileChunk)
-                 _, err = reader.Read(chunkBufferBytes)
-
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
-
-                 // DON't USE ioutil.WriteFile -- it will overwrite the previous bytes!
-                 // write/save buffer to disk
-                 //ioutil.WriteFile(newFileName, chunkBufferBytes, os.ModeAppend)
-
-                 n, err := file.Write(chunkBufferBytes)
-
-                 if err != nil {
-                         fmt.Println(err)
-                         os.Exit(1)
-                 }
-
-                 file.Sync() //flush to disk
-
-                 // free up the buffer for next cycle
-                 // should not be a problem if the chunk size is small, but
-                 // can be resource hogging if the chunk size is huge.
-                 // also a good practice to clean up your own plate after eating
-
-                 chunkBufferBytes = nil // reset or empty our buffer
-
-                 fmt.Println("Written ", n, " bytes")
-
-                 fmt.Println("Recombining part [", j, "] into : ", newFileName)
-         }
-
-         // now, we close the newFileName
-         file.Close()*/
+        file.Close()
 
 }
+
+//Funcion para elegir un numero al azar
+func azar() int {
+    rand.Seed(time.Now().UnixNano())
+    min := 1
+    max := 3
+    var number int = rand.Intn(max - min + 1) + min
+    return number
+    
+}
+
+var addresses[4] string = [4]string{":9000",":9001",":9002",":9003"}
+var tipo_algoritmo int
 
 func main() {
 
         var tipo int
         var nombre_libro string
-    
+        
         fmt.Println("1. Uploader")
         fmt.Println("2. Downloader")
-        fmt.Println("3. Test")
         fmt.Scan(&tipo)
 
         switch tipo {
                 case 1:
+                        fmt.Println("Seleccione tipo de algoritmo")
+                        fmt.Println("1. Exclusion Mutua Distribuida")
+                        fmt.Println("2. Exclusion Mutua Centralizada")
+                        fmt.Scan(&tipo_algoritmo)
                         fmt.Println("¿Que libro desea subir?")
                         fmt.Scan(&nombre_libro)                 
                         uploader(nombre_libro)
-                case 2:
-                        fmt.Println("¿Que libro desea descargar?")
-                        fmt.Scan(&nombre_libro)   
-                        downloader(nombre_libro)
-                case 3:
-                        send_chunk()
+                case 2: 
+                        downloader()
         }
 
         
